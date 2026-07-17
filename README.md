@@ -36,8 +36,6 @@ sudo rm /etc/apparmor.d/python3-userns
 
 ## 使い方
 
-### bubblewrap 風サンドボックス
-
 ```bash
 # ホストのFSを読み取り専用で見せる (/tmp だけ書き込み可)
 python3 mini_sandbox.py --ro-bind / / --bind /tmp /tmp -- ls /
@@ -47,17 +45,12 @@ python3 mini_sandbox.py --ro-bind / / --unshare-pid -- ps aux
 
 # + ネットワーク遮断
 python3 mini_sandbox.py --ro-bind / / --unshare-pid --unshare-net -- curl https://example.com
-```
 
-### コンテナ風 (rootfs 差し替え)
-
-```bash
-# Alpine Linux の minirootfs を「イメージ」として使う
+# --ro-bind の SRC を別の rootfs にすると、コンテナのようにも動く
 mkdir rootfs
 curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.4-x86_64.tar.gz \
   | tar xz -C rootfs
-
-python3 mini_sandbox.py --rootfs ./rootfs --unshare-pid --unshare-net -- /bin/cat /etc/os-release
+python3 mini_sandbox.py --ro-bind ./rootfs / --unshare-pid -- /bin/cat /etc/os-release
 ```
 
 ### 隔離状態の観測

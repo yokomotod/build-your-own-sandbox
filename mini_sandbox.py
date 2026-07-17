@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-mini-sandbox: Linux namespace を使ったミニマルコンテナランタイム
+mini-sandbox: Linux namespace を使ったミニマルサンドボックス
 
 使い方:
   mini-sandbox --ro-bind / / -- ls /
   mini-sandbox --ro-bind / / --bind /tmp /tmp -- touch /tmp/test
   mini-sandbox --ro-bind / / --unshare-pid -- ps aux
   mini-sandbox --ro-bind / / --unshare-pid --unshare-net -- curl example.com
-  mini-sandbox --rootfs ./rootfs --unshare-pid --unshare-net -- /bin/cat /etc/os-release
+  mini-sandbox --ro-bind ./rootfs / --unshare-pid -- /bin/cat /etc/os-release
 """
 import ctypes
 import ctypes.util
@@ -58,53 +58,53 @@ def setup_uid_map(pid, uid, gid):
         f.write(f"{gid} {gid} 1\n")
 
 
-def setup_fs(ro_binds, binds, rootfs, unshare_pid):
+def setup_fs(ro_binds, binds, unshare_pid):
     # ここでのマウント操作がホスト側へ伝播しないようにする
     do_mount("", "/", "", MS_PRIVATE | MS_REC)
 
-    if rootfs:
-        # runc 方式: pivot_root でルートごと rootfs に差し替える
-        rootfs = os.path.realpath(rootfs)
-        # 自分自身に bind mount してマウントポイントにする (pivot_root の要件)
-        do_mount(rootfs, rootfs, "", MS_BIND)
+    # 空の tmpfs を newroot として作る (tmpfs 自体がマウントポイントなので pivot_root の要件を満たす)
+    # (本家 bwrap は tmpfs の中に newroot サブディレクトリを切って pivot_root を2回行うが、簡略化)
+    do_mount("tmpfs", "/tmp", "tmpfs", 0)
 
-        old_root = os.path.join(rootfs, ".old_root")
-        os.makedirs(old_root, exist_ok=True)
-        do_pivot_root(rootfs, old_root)  # 旧ルートは .old_root に退避される
-        os.chdir("/")
+    # newroot の中に --ro-bind / --bind で指定されたパスをマウントしていく
+    for src, dest in ro_binds:
+        src = os.path.realpath(src)
+        target = f"/tmp{dest}"
+        os.makedirs(target, exist_ok=True)
+        do_mount(src, target, "", MS_BIND | MS_REC)
+        do_mount("", target, "", MS_REMOUNT | MS_BIND | MS_REC | MS_RDONLY)  # bind mount は作成時にフラグを指定できないので、再マウントで read-only 化
 
-        # /proc は旧ルートを切り離す前にマウントする必要がある
-        os.makedirs("/proc", exist_ok=True)
-        if unshare_pid:
-            do_mount("proc", "/proc", "proc", 0)
-        else:
-            # 新しい PID namespace がないと fresh な procfs はマウントできない
-            # (カーネルの制約)。同じ PID 空間のままなのでホストの /proc を見せる
-            do_mount("/.old_root/proc", "/proc", "", MS_BIND | MS_REC)
+    for src, dest in binds:
+        src = os.path.realpath(src)
+        target = f"/tmp{dest}"
+        os.makedirs(target, exist_ok=True)
+        do_mount(src, target, "", MS_BIND | MS_REC)
+        do_mount("", target, "", MS_REMOUNT | MS_BIND | MS_REC)
 
-        # 旧ルート (ホストの FS) を切り離して到達不能にする
-        do_mount("", "/.old_root", "", MS_PRIVATE | MS_REC)
-        libc.umount2("/.old_root".encode(), MNT_DETACH)
-        os.rmdir("/.old_root")
+    # /proc をマウント
+    proc_target = "/tmp/proc"
+    os.makedirs(proc_target, exist_ok=True)
+    if unshare_pid:
+        do_mount("proc", proc_target, "proc", 0)
     else:
-        # bubblewrap 方式: ホストの FS を重ねたまま read-only のフィルターをかける
-        for src, dest in ro_binds:
-            do_mount(src, dest, "", MS_BIND | MS_REC)
-            do_mount("", dest, "", MS_REMOUNT | MS_BIND | MS_REC | MS_RDONLY)  # bind mount は作成時にフラグを指定できないので、再マウントで read-only 化
+        do_mount("/proc", proc_target, "", MS_BIND | MS_REC)
 
-        # 書き込み許可するパスだけ上から重ねて read-only を打ち消す
-        for src, dest in binds:
-            if not os.path.exists(src):
-                continue
-            do_mount(src, dest, "", MS_BIND | MS_REC)
-            do_mount("", dest, "", MS_REMOUNT | MS_BIND | MS_REC)
+    # pivot_root で newroot に切り替え
+    # pivot_root(".", ".") は runc/LXC も使っているテクニックで、
+    # put_old を newroot 内に別途用意する必要がない
+    oldroot_fd = os.open("/", os.O_DIRECTORY | os.O_RDONLY)
+    os.chdir("/tmp")
+    do_pivot_root(".", ".")
 
-        # 新しい PID namespace の中身を映すために /proc をマウントし直す
-        if unshare_pid:
-            do_mount("proc", "/proc", "proc", 0)
+    # 旧ルート (ホストの FS) を切り離して到達不能にする
+    os.fchdir(oldroot_fd)
+    do_mount("", ".", "", MS_PRIVATE | MS_REC)
+    libc.umount2(".".encode(), MNT_DETACH)
+    os.close(oldroot_fd)
+    os.chdir("/")
 
 
-def run(command, ro_binds, binds, rootfs, unshare_pid, unshare_net):
+def run(command, ro_binds, binds, unshare_pid, unshare_net):
     # unshare 後は uid_map 設定まで getuid() が nobody になるので先に保存
     host_uid = os.getuid()
     host_gid = os.getgid()
@@ -123,7 +123,7 @@ def run(command, ro_binds, binds, rootfs, unshare_pid, unshare_net):
     if not unshare_pid:
         # mount / network / user は unshare した時点で自分が移っているので
         # そのまま exec すれば namespace への所属は引き継がれる
-        setup_fs(ro_binds, binds, rootfs, unshare_pid)
+        setup_fs(ro_binds, binds, unshare_pid)
         os.execvp(command[0], command)
 
     # PID だけは別: プロセスの PID は生成時に決まるので、既存プロセスは
@@ -132,7 +132,7 @@ def run(command, ro_binds, binds, rootfs, unshare_pid, unshare_net):
     if pid == 0:
         # 子プロセス: 新しい PID namespace 内で PID 1
         try:
-            setup_fs(ro_binds, binds, rootfs, unshare_pid)
+            setup_fs(ro_binds, binds, unshare_pid)
             os.execvp(command[0], command)
         except Exception as e:
             print(f"mini-sandbox: {e}", file=sys.stderr)
@@ -155,7 +155,6 @@ def main():
 
     ro_binds = []
     binds = []
-    rootfs = None
     unshare_pid = False
     unshare_net = False
     command = []
@@ -175,12 +174,6 @@ def main():
                 sys.exit(2)
             binds.append((args[i + 1], args[i + 2]))
             i += 3
-        elif arg == "--rootfs":
-            if i + 1 >= len(args):
-                print("error: --rootfs requires PATH", file=sys.stderr)
-                sys.exit(2)
-            rootfs = args[i + 1]
-            i += 2
         elif arg == "--unshare-pid":
             unshare_pid = True
             i += 1
@@ -200,15 +193,11 @@ def main():
         print("error: no command specified", file=sys.stderr)
         sys.exit(2)
 
-    if not ro_binds and not rootfs:
-        print("error: specify --ro-bind or --rootfs", file=sys.stderr)
+    if not ro_binds:
+        print("error: at least one --ro-bind is required", file=sys.stderr)
         sys.exit(2)
 
-    if ro_binds and rootfs:
-        print("error: --ro-bind and --rootfs are mutually exclusive", file=sys.stderr)
-        sys.exit(2)
-
-    run(command, ro_binds, binds, rootfs, unshare_pid, unshare_net)
+    run(command, ro_binds, binds, unshare_pid, unshare_net)
 
 
 if __name__ == "__main__":
