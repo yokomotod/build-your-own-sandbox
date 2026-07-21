@@ -2,7 +2,7 @@
 
 Claude Code / Codex のサンドボックスに使われている [bubblewrap](https://github.com/containers/bubblewrap) を Python で自作して、Linux namespace によるサンドボックス / コンテナの仕組みを理解するためのサンプルコードです。
 
-解説記事: <!-- TODO: 公開後に記事URLを追記 -->
+解説記事: [Claude CodeやCodexのサンドボックスを支えるbubblewrapを自作して理解する。その勢いでDockerも理解する](https://www.m3tech.blog/entry/2026/07/21/100000)
 
 ## 動作環境
 
